@@ -59,7 +59,20 @@ def _update_optimizer_with_manual_step_learning_rate(
     schedule.learning_rate = initial_learning_rate * learning_rate_scaling**i
 
 
+def _update_optimizer_with_cosine_decay_learning_rate(
+    optimizer, learning_rate, warmup_learning_rate):
+  """Adds a new cosine decay learning rate."""
+  cosine_lr = optimizer.learning_rate.cosine_decay_learning_rate
+  cosine_lr.learning_rate_base = learning_rate
+  cosine_lr.warmup_learning_rate = warmup_learning_rate
+
+
 class ConfigUtilTest(tf.test.TestCase):
+
+  def _create_and_load_test_configs(self, pipeline_config):
+    pipeline_config_path = os.path.join(self.get_temp_dir(), "pipeline.config")
+    _write_config(pipeline_config, pipeline_config_path)
+    return config_util.get_configs_from_pipeline_file(pipeline_config_path)
 
   def test_get_configs_from_pipeline_file(self):
     """Test that proto configs can be read from pipeline config file."""
@@ -85,6 +98,26 @@ class ConfigUtilTest(tf.test.TestCase):
     self.assertProtoEquals(pipeline_config.eval_input_reader,
                            configs["eval_input_config"])
 
+  def test_create_configs_from_pipeline_proto(self):
+    """Tests creating configs dictionary from pipeline proto."""
+
+    pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
+    pipeline_config.model.faster_rcnn.num_classes = 10
+    pipeline_config.train_config.batch_size = 32
+    pipeline_config.train_input_reader.label_map_path = "path/to/label_map"
+    pipeline_config.eval_config.num_examples = 20
+    pipeline_config.eval_input_reader.queue_capacity = 100
+
+    configs = config_util.create_configs_from_pipeline_proto(pipeline_config)
+    self.assertProtoEquals(pipeline_config.model, configs["model"])
+    self.assertProtoEquals(pipeline_config.train_config,
+                           configs["train_config"])
+    self.assertProtoEquals(pipeline_config.train_input_reader,
+                           configs["train_input_config"])
+    self.assertProtoEquals(pipeline_config.eval_config, configs["eval_config"])
+    self.assertProtoEquals(pipeline_config.eval_input_reader,
+                           configs["eval_input_config"])
+
   def test_create_pipeline_proto_from_configs(self):
     """Tests that proto can be reconstructed from configs dictionary."""
     pipeline_config_path = os.path.join(self.get_temp_dir(), "pipeline.config")
@@ -100,6 +133,23 @@ class ConfigUtilTest(tf.test.TestCase):
     configs = config_util.get_configs_from_pipeline_file(pipeline_config_path)
     pipeline_config_reconstructed = (
         config_util.create_pipeline_proto_from_configs(configs))
+    self.assertEqual(pipeline_config, pipeline_config_reconstructed)
+
+  def test_save_pipeline_config(self):
+    """Tests that the pipeline config is properly saved to disk."""
+    pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
+    pipeline_config.model.faster_rcnn.num_classes = 10
+    pipeline_config.train_config.batch_size = 32
+    pipeline_config.train_input_reader.label_map_path = "path/to/label_map"
+    pipeline_config.eval_config.num_examples = 20
+    pipeline_config.eval_input_reader.queue_capacity = 100
+
+    config_util.save_pipeline_config(pipeline_config, self.get_temp_dir())
+    configs = config_util.get_configs_from_pipeline_file(
+        os.path.join(self.get_temp_dir(), "pipeline.config"))
+    pipeline_config_reconstructed = (
+        config_util.create_pipeline_proto_from_configs(configs))
+
     self.assertEqual(pipeline_config, pipeline_config_reconstructed)
 
   def test_get_configs_from_multiple_files(self):
@@ -154,6 +204,7 @@ class ConfigUtilTest(tf.test.TestCase):
     """Asserts successful updating of all learning rate schemes."""
     original_learning_rate = 0.7
     learning_rate_scaling = 0.1
+    warmup_learning_rate = 0.07
     hparams = tf.contrib.training.HParams(learning_rate=0.15)
     pipeline_config_path = os.path.join(self.get_temp_dir(), "pipeline.config")
 
@@ -201,6 +252,24 @@ class ConfigUtilTest(tf.test.TestCase):
       self.assertAlmostEqual(hparams.learning_rate * learning_rate_scaling**i,
                              schedule.learning_rate)
 
+    # Cosine decay learning rate.
+    pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
+    optimizer = getattr(pipeline_config.train_config.optimizer, optimizer_name)
+    _update_optimizer_with_cosine_decay_learning_rate(optimizer,
+                                                      original_learning_rate,
+                                                      warmup_learning_rate)
+    _write_config(pipeline_config, pipeline_config_path)
+
+    configs = config_util.get_configs_from_pipeline_file(pipeline_config_path)
+    configs = config_util.merge_external_params_with_configs(configs, hparams)
+    optimizer = getattr(configs["train_config"].optimizer, optimizer_name)
+    cosine_lr = optimizer.learning_rate.cosine_decay_learning_rate
+
+    self.assertAlmostEqual(hparams.learning_rate, cosine_lr.learning_rate_base)
+    warmup_scale_factor = warmup_learning_rate / original_learning_rate
+    self.assertAlmostEqual(hparams.learning_rate * warmup_scale_factor,
+                           cosine_lr.warmup_learning_rate)
+
   def testRMSPropWithNewLearingRate(self):
     """Tests new learning rates for RMSProp Optimizer."""
     self._assertOptimizerWithNewLearningRate("rms_prop_optimizer")
@@ -242,6 +311,34 @@ class ConfigUtilTest(tf.test.TestCase):
     configs = config_util.merge_external_params_with_configs(configs, hparams)
     new_batch_size = configs["train_config"].batch_size
     self.assertEqual(1, new_batch_size)  # Clipped to 1.0.
+
+  def testOverwriteBatchSizeWithKeyValue(self):
+    """Tests that batch size is overwritten based on key/value."""
+    pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
+    pipeline_config.train_config.batch_size = 2
+    configs = self._create_and_load_test_configs(pipeline_config)
+    hparams = tf.contrib.training.HParams(**{"train_config.batch_size": 10})
+    configs = config_util.merge_external_params_with_configs(configs, hparams)
+    new_batch_size = configs["train_config"].batch_size
+    self.assertEqual(10, new_batch_size)
+
+  def testKeyValueOverrideBadKey(self):
+    """Tests that overwriting with a bad key causes an exception."""
+    pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
+    configs = self._create_and_load_test_configs(pipeline_config)
+    hparams = tf.contrib.training.HParams(**{"train_config.no_such_field": 10})
+    with self.assertRaises(ValueError):
+      config_util.merge_external_params_with_configs(configs, hparams)
+
+  def testOverwriteBatchSizeWithBadValueType(self):
+    """Tests that overwriting with a bad valuye type causes an exception."""
+    pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
+    pipeline_config.train_config.batch_size = 2
+    configs = self._create_and_load_test_configs(pipeline_config)
+    # Type should be an integer, but we're passing a string "10".
+    hparams = tf.contrib.training.HParams(**{"train_config.batch_size": "10"})
+    with self.assertRaises(TypeError):
+      config_util.merge_external_params_with_configs(configs, hparams)
 
   def testNewMomentumOptimizerValue(self):
     """Tests that new momentum value is updated appropriately."""
@@ -397,6 +494,27 @@ class ConfigUtilTest(tf.test.TestCase):
     self.assertEqual(new_label_map_path,
                      configs["eval_input_config"].label_map_path)
 
+  def testDontOverwriteEmptyLabelMapPath(self):
+    """Tests that label map path will not by overwritten with empty string."""
+    original_label_map_path = "path/to/original/label_map"
+    new_label_map_path = ""
+    pipeline_config_path = os.path.join(self.get_temp_dir(), "pipeline.config")
+
+    pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
+    train_input_reader = pipeline_config.train_input_reader
+    train_input_reader.label_map_path = original_label_map_path
+    eval_input_reader = pipeline_config.eval_input_reader
+    eval_input_reader.label_map_path = original_label_map_path
+    _write_config(pipeline_config, pipeline_config_path)
+
+    configs = config_util.get_configs_from_pipeline_file(pipeline_config_path)
+    configs = config_util.merge_external_params_with_configs(
+        configs, label_map_path=new_label_map_path)
+    self.assertEqual(original_label_map_path,
+                     configs["train_input_config"].label_map_path)
+    self.assertEqual(original_label_map_path,
+                     configs["eval_input_config"].label_map_path)
+
   def testNewMaskType(self):
     """Tests that mask type can be overwritten in input readers."""
     original_mask_type = input_reader_pb2.NUMERICAL_MASKS
@@ -415,6 +533,19 @@ class ConfigUtilTest(tf.test.TestCase):
         configs, mask_type=new_mask_type)
     self.assertEqual(new_mask_type, configs["train_input_config"].mask_type)
     self.assertEqual(new_mask_type, configs["eval_input_config"].mask_type)
+
+  def testUseMovingAverageForEval(self):
+    use_moving_averages_orig = False
+    pipeline_config_path = os.path.join(self.get_temp_dir(), "pipeline.config")
+
+    pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
+    pipeline_config.eval_config.use_moving_averages = use_moving_averages_orig
+    _write_config(pipeline_config, pipeline_config_path)
+
+    configs = config_util.get_configs_from_pipeline_file(pipeline_config_path)
+    configs = config_util.merge_external_params_with_configs(
+        configs, eval_with_moving_averages=True)
+    self.assertEqual(True, configs["eval_config"].use_moving_averages)
 
   def  test_get_image_resizer_config(self):
     """Tests that number of classes can be retrieved."""
